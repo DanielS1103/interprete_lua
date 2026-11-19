@@ -19,7 +19,7 @@ python -m venv .venv
    ```bash
    pip install antlr4-python3-runtime
    ```
-   *(También puedes usar `pip install -r requirements.txt`)*.
+   *(También se puede usar `pip install -r requirements.txt`)*.
 
 ## Ejecución
 
