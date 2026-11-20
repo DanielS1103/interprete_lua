@@ -1,3 +1,3 @@
-antlr4-python3-runtime==4.13.2
-antlr4-tools==0.2.2
-install-jdk==1.1.0
+# El intérprete no necesita dependencias externas: el runtime de ANTLR (Python puro) está incluido en ./antlr4.
+# Solo se necesitaría para regenerar el parser desde grammar/*.g4:
+#   java -jar antlr-4.13.2-complete.jar -Dlanguage=Python3 -visitor -no-listener LuaLexer.g4 LuaParser.g4

@@ -7,6 +7,7 @@ class Environment:
         self.consts = set()
         self.to_close = []
         self.env_table = env_table  # Referencia a _ENV global
+        self.is_func = False  # True para el entorno raíz de una llamada a función (para 'local' vs 'upvalue')
 
     def define_local(self, name, value, attrib=None):
         self.vars[name] = value

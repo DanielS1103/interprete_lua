@@ -97,10 +97,13 @@ exp
     | exp ('*' | '/' | '%' | '//') exp
     | exp ('+' | '-') exp
     | <assoc = right> exp ('..') exp
+    | exp ('<<' | '>>') exp
+    | exp ('&') exp
+    | exp ('~') exp
+    | exp ('|') exp
     | exp ('<' | '>' | '<=' | '>=' | '~=' | '==') exp
     | exp ('and') exp
     | exp ('or') exp
-    | exp ('&' | '|' | '~' | '<<' | '>>') exp
     ;
 
 // var ::=  Name | prefixexp '[' exp ']' | prefixexp '.' Name

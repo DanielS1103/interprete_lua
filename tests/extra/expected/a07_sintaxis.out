@@ -1,0 +1,37 @@
+26.0	20	512.0	-4.0	true	true	123
+3x	true	true	1	2	nil	false
+11	3	1	4	8	5	true	3	250	true
+true	true	a	4	-3	false
+5	0.5	2.0	1	2	true	true	3	3
+1.0	9.007199254741e+15	100.0	0.5	21.0	0.03	0.0	2748
+single	dbl "q"	it's	esc 'q'	tab	here	nl\n	ABCD	joined	10
+long
+string	with ]] inside	skip first newline	1
+tras comentario
+tras otro
+4	ñ	195	177
+b
+xxx	3	5	string	table	true
+9	kk	true
+3
+0	0
+b	d	3	1
+1	2	3	4	5
+4	2
+1
+1	2	3
+1	nil
+1	nil
+2	v	nil
+1	nil	nil
+1	2
+5	nil
+55
+35
+neg	zero	small	big
+5.0	9.0	3	3	-2	16	true
+integer	float	float
+true	true	true	true	true	true
+false	9.2233720368548e+18	true
+true	true	true	true	true
+true	inf	-inf	0.0	-0.0	-1	1	-0.5	0.5	-3	-3	-3.0

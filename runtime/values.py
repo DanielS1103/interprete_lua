@@ -37,14 +37,28 @@ class _RefKey:
             return other() is self.obj
         return False
 
+class _BoolKey:
+    """Centinela para llaves booleanas (en Python True == 1 y False == 0)."""
+    def __init__(self, value):
+        self.value = value
+
+_TRUE_KEY = _BoolKey(True)
+_FALSE_KEY = _BoolKey(False)
+
 class LuaTable:
     def __init__(self):
         self._data = {}
         self.metatable = None
+        self.asize = 0  # tamaño de la parte "array" fijado por el constructor (emula luaH_getn)
+        self.hint = 0   # último border calculado (evita recorrer la secuencia en cada '#')
 
     def _normalize_key(self, key):
         if key is None:
             raise LuaError("table index is nil")
+        if key is True:
+            return _TRUE_KEY
+        if key is False:
+            return _FALSE_KEY
         if isinstance(key, float):
             if math.isnan(key):
                 raise LuaError("table index is NaN")
@@ -62,6 +76,12 @@ class LuaTable:
         return ""
 
     def rawget(self, key):
+        tk = type(key)
+        if tk is str or tk is int:  # camino rápido (los más frecuentes)
+            val = self._data.get(key)
+            if val.__class__ is weakref.ref:
+                return val()
+            return val
         try:
             nk = self._normalize_key(key)
         except LuaError:
@@ -72,6 +92,13 @@ class LuaTable:
         return val
 
     def rawset(self, key, value):
+        tk = type(key)
+        if (tk is str or tk is int) and self.metatable is None:  # camino rápido
+            if value is None:
+                self._data.pop(key, None)
+            else:
+                self._data[key] = value
+            return
         nk = self._normalize_key(key)
         if value is None:
             self._data.pop(nk, None)
@@ -92,5 +119,32 @@ class LuaTable:
             if real_k is None or real_v is None:
                 self._data.pop(k, None)
                 continue
-            valid_keys.append(real_k.obj if isinstance(real_k, _RefKey) else real_k)
+            if isinstance(real_k, _RefKey):
+                real_k = real_k.obj
+            elif isinstance(real_k, _BoolKey):
+                real_k = real_k.value
+            valid_keys.append(real_k)
         return valid_keys
+
+    def length(self):
+        """Longitud 'border' como luaH_getn de Lua 5.4 (considera el tamaño del array del constructor)."""
+        n = self.asize
+        if n > 0 and self.rawget(n) is None:
+            # el último elemento del array es nil: búsqueda binaria de un border en [0, n]
+            i, j = 0, n
+            while j - i > 1:
+                m = (i + j) // 2
+                if self.rawget(m) is None:
+                    j = m
+                else:
+                    i = m
+            return i
+        h = self.hint
+        if h < n:
+            h = n
+        while h > n and self.rawget(h) is None:  # la tabla se redujo: bajar hasta un border válido
+            h -= 1
+        while self.rawget(h + 1) is not None:
+            h += 1
+        self.hint = h
+        return h
