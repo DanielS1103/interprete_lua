@@ -9,7 +9,7 @@ escrito en **Python 3**: el análisis léxico y sintáctico lo hace un parser ge
 
 | Nombre | Correo / usuario |
 |---|---|
-| _<nombre 1>_ | _<correo>_ |
+| _Daniel Alejandro Acosta Avila_ | _dacostaav@unal.edu.co_ |
 | _<nombre 2>_ | _<correo>_ |
 | _<nombre 3>_ | _<correo>_ |
 
