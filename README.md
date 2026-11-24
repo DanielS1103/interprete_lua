@@ -212,27 +212,3 @@ En el código intermedio de la clase las estructuras de control se traducen a sa
 | `goto` / etiqueta | `br Etiqueta` | `goto` lanza `LuaGoto`; `visitBlock` la atrapa y continúa desde el índice de la etiqueta |
 | asignación | `Expr.cod; stloc pos` | `Environment.assign`; las tablas pasan por `_table_set` (metamétodo `__newindex`) |
 | `print` / entrada | `Console.Write` / `ReadLine` | `print` → `write_out`; `io.read` lee de `stdin` |
-
-### Código intermedio: qué pasaría con un traductor
-
-Si en lugar de interpretar se tradujera Lua a otro lenguaje (la otra opción del taller), el esquema sería el de
-la clase: una DDS/ETDS que lleva en cada atributo `trad` o `cod` el código del subárbol (como
-`E.trad := "sum(" || E1.trad || "," || T.trad || ")"`), y una tabla de símbolos para decidir, por ejemplo, el
-tipo de cada variable. Para `a = 2.3 + 3*4.5` el equivalente sería código de tres direcciones
-(`ITOR 3 t1; MULR t1 4.5 t2; ADDR 2.3 t2 t3; STOR t3 a`) o de pila (`ldc.r8 2.3; ldc.i4 3; conv.r8; ldc.r8 4.5;
-mul; add; stloc a`). Este proyecto no genera nada de eso: el árbol se evalúa directamente y por eso las
-diferencias de rendimiento con un compilador son grandes (ver *Limitaciones*).
-
-## Limitaciones conocidas
-
-* El nombre de *chunk* en los mensajes de error es siempre `input` (Lua usa el nombre del archivo).
-* `pairs` recorre primero la parte secuencial `1..n` y luego el resto en orden de inserción (Lua no
-  garantiza un orden; el real puede diferir en tablas con claves mixtas).
-* Las corrutinas usan un hilo por corrutina (suficiente para generadores/productores-consumidores, pero no
-  para miles de corrutinas simultáneas).
-* No se implementan `string.pack/unpack`, `require`/`package`, `io.open` ni `os.rename/remove`; `utf8` solo
-  tiene `char`, `len`, `codepoint` y `charpattern`, y `debug` solo `traceback`/`getinfo` básicos.
-* Al ser un intérprete de árbol, es del orden de 100 veces más lento que el Lua real (medido en una prueba de carga) (los 6 casos del taller
-  tardan unos 0,3 s; una carga de 200 000 iteraciones, unos segundos).
-* Los errores de sintaxis del programa fuente se reportan por stderr y se intenta ejecutar el árbol
-  recuperado (la entrada del taller se garantiza sintácticamente correcta).
