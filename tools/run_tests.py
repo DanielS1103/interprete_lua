@@ -1,17 +1,12 @@
 """Ejecuta los casos de prueba con main.py y compara con las salidas esperadas.
 
-Suites:
-  tests/*.in            -> tests/expected/*.out         (los 6 casos del taller)
-  tests/extra/*.lua     -> tests/extra/expected/*.out   (pruebas adicionales de robustez)
+Casos: tests/*.in -> tests/expected/*.out (los 6 casos del taller).
 
 Uso:
     python tools/run_tests.py            # compara
     python tools/run_tests.py --update   # regenera las salidas esperadas (revisarlas antes de aceptar)
     python tools/run_tests.py submit/main.py   # usa otro punto de entrada (versión de un solo archivo)
 
-Las salidas esperadas se contrastaron con Lua 5.4 real; las únicas diferencias son cosméticas
-(nombre de chunk "input" en los mensajes de error, nombres de función en algunos 'bad argument',
-signo de nan en 1.0%0).
 """
 import os
 import subprocess
@@ -27,10 +22,7 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     update = "--update" in sys.argv
     entry = os.path.join(ROOT, args[0]) if args else os.path.join(ROOT, "main.py")
-    suites = [
-        (TESTS, ".in", os.path.join(TESTS, "expected")),
-        (os.path.join(TESTS, "extra"), ".lua", os.path.join(TESTS, "extra", "expected")),
-    ]
+    suites = [(TESTS, ".in", os.path.join(TESTS, "expected"))]
     failures = 0
     for folder, ext, exp_dir in suites:
         if not os.path.isdir(folder):

@@ -14,8 +14,9 @@ from LuaLexer import LuaLexer
 from LuaParser import LuaParser
 from interpreter import LuaInterpreter
 from runtime.exceptions import LuaError
-from runtime.stdlib import lua_tostring, write_err
+from runtime.stdlib import lua_tostring, lua_type, write_err
 from runtime.values import LuaTable
+from runtime import luacheck
 
 
 class _CollectErrors(ErrorListener):
@@ -26,12 +27,15 @@ class _CollectErrors(ErrorListener):
         self.messages.append(f"input:{line}:{column}: {msg}")
 
 
-def run_source(source):
+def run_source(source, interp=None):
     """Analiza y ejecuta un programa Lua (el texto usa un carácter por byte, latin-1).
 
-    La entrada se garantiza sintácticamente correcta; si ANTLR reporta algo, se avisa por
-    stderr pero se intenta ejecutar igualmente el árbol recuperado.
+    Si el programa tiene errores de sintaxis, Lua no ejecuta nada: se informa el error con el
+    mismo mensaje que el compilador oficial (runtime/luacheck.py) y se termina con código 1.
+    Si solo ANTLR se queja (el verificador lo acepta), se ejecuta el árbol recuperado.
     """
+    if source.startswith("#"):
+        source = "--" + source[1:]  # como lua.c: se ignora una primera línea '#!...'
     errors = _CollectErrors()
     lexer = LuaLexer(InputStream(source))
     lexer.removeErrorListeners()
@@ -40,9 +44,13 @@ def run_source(source):
     parser.removeErrorListeners()
     parser.addErrorListener(errors)
     tree = parser.start_()
-    for m in errors.messages:
-        write_err(f"lua: {m}\n")
-    LuaInterpreter().visit(tree.chunk())
+    if errors.messages:
+        problem = luacheck.check(source, "input")
+        if problem is not None:
+            raise LuaError(problem[0])
+        for m in errors.messages:
+            write_err("lua: " + m + chr(10))
+    (interp or LuaInterpreter()).visit(tree.chunk())
 
 
 def read_file(path):
@@ -51,30 +59,47 @@ def read_file(path):
 
 
 def error_text(err):
+    """Mensaje como el 'msghandler' de lua.c para errores no capturados."""
     obj = err.lua_obj
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, (int, float)) and not isinstance(obj, bool):
+        return lua_tostring(obj)
     if isinstance(obj, LuaTable):
         mm = obj.metatable.rawget("__tostring") if isinstance(obj.metatable, LuaTable) else None
-        if mm is None:
-            return "(error object is a table value)"
-    if obj is None:
-        return "nil"
-    return lua_tostring(obj)
+        if mm is not None:
+            return lua_tostring(obj, _CURRENT[0])
+    return "(error object is a %s value)" % lua_type(obj)
+
+
+_CURRENT = [None]
 
 
 def run_guarded(source, name=None):
-    """Ejecuta y devuelve el código de salida (0 ok, 1 error)."""
+    """Ejecuta y devuelve el código de salida (0 ok, 1 error).
+
+    Al final (con o sin error) se cierra el estado: se llaman los finalizadores '__gc'
+    pendientes, igual que lua_close en el intérprete oficial.
+    """
+    interp = LuaInterpreter()
+    _CURRENT[0] = interp
     try:
-        run_source(source)
+        run_source(source, interp)
         return 0
     except LuaError as e:
         sys.stdout.flush()
-        write_err(f"lua: {error_text(e)}\n")
+        write_err("lua: " + error_text(e) + chr(10))
     except RecursionError:
         sys.stdout.flush()
-        write_err("lua: stack overflow\n")
+        write_err("lua: stack overflow" + chr(10))
     except Exception as e:  # error interno (p. ej. árbol de sintaxis incompleto)
         sys.stdout.flush()
-        write_err(f"lua: {type(e).__name__}: {e}\n")
+        write_err("lua: %s: %s" % (type(e).__name__, e) + chr(10))
+    finally:
+        try:
+            interp.close_state()
+        except BaseException:
+            pass
     return 1
 
 
@@ -108,7 +133,7 @@ def start():
     for stack_mb in (512, 256, 64, 16):
         try:
             threading.stack_size(stack_mb * 1024 * 1024)
-            sys.setrecursionlimit(220_000)
+            sys.setrecursionlimit(400_000 if sys.version_info >= (3, 11) else 220_000)
             t = threading.Thread(target=target)
             t.start()
             started = True

@@ -13,7 +13,7 @@ from grammar.LuaParser import LuaParser
 from runtime.values import LuaTable, MultiRes, unwrap_one
 from runtime.environment import Environment
 from runtime.exceptions import LuaError
-from runtime import lpattern
+from runtime import lpattern, luacheck
 
 MAXINT = 0x7FFFFFFFFFFFFFFF
 MININT = -0x8000000000000000
@@ -84,6 +84,23 @@ def str2number(text):
             return None
         return -val if sign == "-" else val
     return None
+
+
+def chunkid(source):
+    """Nombre de un chunk para los mensajes, como luaO_chunkid (LUA_IDSIZE = 60)."""
+    idsize = 60
+    if source.startswith("="):
+        return source[1:idsize]
+    if source.startswith("@"):
+        if len(source) <= idsize:
+            return source[1:]
+        return "..." + source[len(source) - (idsize - 4):]
+    nl = source.find("\n")
+    bufflen = idsize - len('[string "..."]') - 1
+    if len(source) < bufflen and nl < 0:
+        return '[string "' + source + '"]'
+    s = source if nl < 0 else source[:nl]
+    return '[string "' + s[:bufflen] + '..."]'
 
 
 def is_number(v):
@@ -335,16 +352,21 @@ class LuaCoroutine:
 def build_global_env(interp):
     env = LuaTable()
     env.rawset("_G", env)
-    env.rawset("_ENV", env)
     env.rawset("_VERSION", "Lua 5.4")
 
     # ---- helpers de validación ----
+    def tname(v, n):
+        """Tipo de un argumento para mensajes 'bad argument' ("no value" si no se pasó)."""
+        if v is None and n > getattr(interp, "nargs", 0):
+            return "no value"
+        return lua_type(v)
+
     def arg_error(n, fname, msg):
         raise interp.rt_error(f"bad argument #{n} to '{fname}' ({msg})")
 
     def check_table(v, n, fname):
         if not isinstance(v, LuaTable):
-            arg_error(n, fname, f"table expected, got {lua_type(v) if v is not None else 'no value'}")
+            arg_error(n, fname, f"table expected, got {tname(v, n)}")
         return v
 
     def check_int(v, n, fname, default=None):
@@ -362,7 +384,7 @@ def build_global_env(interp):
             num = str2number(v)
             if num is not None:
                 return check_int(num, n, fname)
-        arg_error(n, fname, f"number expected, got {lua_type(v) if v is not None else 'no value'}")
+        arg_error(n, fname, f"number expected, got {tname(v, n)}")
 
     def check_num(v, n, fname, default=None):
         if v is None and default is not None:
@@ -373,7 +395,7 @@ def build_global_env(interp):
             num = str2number(v)
             if num is not None:
                 return num
-        arg_error(n, fname, f"number expected, got {lua_type(v) if v is not None else 'no value'}")
+        arg_error(n, fname, f"number expected, got {tname(v, n)}")
 
     def check_str(v, n, fname, default=None):
         if v is None and default is not None:
@@ -382,7 +404,7 @@ def build_global_env(interp):
             return v
         if is_number(v):
             return lua_tostring(v)
-        arg_error(n, fname, f"string expected, got {lua_type(v) if v is not None else 'no value'}")
+        arg_error(n, fname, f"string expected, got {tname(v, n)}")
 
     def tostr(v):
         return lua_tostring(v, interp)
@@ -448,6 +470,7 @@ def build_global_env(interp):
             self.errors.append((line, tok))
 
     def _load(chunk=None, chunkname=None, mode="bt", custom_env=None):
+        has_env = interp.nargs >= 4  # load(s, n, m, nil) fija _ENV = nil
         if callable(chunk) and not isinstance(chunk, str):
             parts = []
             while True:
@@ -460,14 +483,16 @@ def build_global_env(interp):
         elif isinstance(chunk, str):
             default_name = chunk
         else:
-            arg_error(1, "load", f"function expected, got {lua_type(chunk) if chunk is not None else 'no value'}")
+            arg_error(1, "load", f"function expected, got {tname(chunk, 1)}")
         name = chunkname if isinstance(chunkname, str) else default_name
-        if name.startswith("=") or name.startswith("@"):
-            display = name[1:]
-        else:
-            first_line = name.split("\n", 1)[0]
-            display = '[string "' + (first_line if first_line == name else first_line + "...") + '"]'
+        display = chunkid(name)
+        if isinstance(mode, str) and "t" not in mode:
+            return MultiRes([None, f"attempt to load a text chunk (mode is '{mode}')"])
         from interpreter import LuaFunction
+        # Errores de compilación con los mensajes de Lua (léxicos, sintácticos y semánticos)
+        problem = luacheck.check(chunk, display)
+        if problem is not None:
+            return MultiRes([None, problem[0]])
         collector = _SyntaxCollector()
         lexer = LuaLexer(InputStream(chunk))
         lexer.removeErrorListeners()
@@ -479,18 +504,20 @@ def build_global_env(interp):
         if collector.errors:
             line, tok = collector.errors[0]
             return MultiRes([None, f"{display}:{line}: syntax error near {tok}"])
-        target_env_tbl = custom_env if custom_env is not None else env
+        target_env_tbl = custom_env if (custom_env is not None or has_env) else env
         chunk_env = Environment(parent=None, env_table=target_env_tbl)
         return LuaFunction([], True, tree.chunk().block(), chunk_env, interp, display)
 
     def _setmetatable(t=None, mt=None):
         if not isinstance(t, LuaTable):
-            arg_error(1, "setmetatable", f"table expected, got {lua_type(t) if t is not None else 'no value'}")
+            arg_error(1, "setmetatable", f"table expected, got {tname(t, 1)}")
         if mt is not None and not isinstance(mt, LuaTable):
             arg_error(2, "setmetatable", f"nil or table expected, got {lua_type(mt)}")
         if isinstance(t.metatable, LuaTable) and t.metatable.rawget("__metatable") is not None:
             raise interp.rt_error("cannot change a protected metatable")
         t.metatable = mt
+        if mt is not None and mt.rawget("__gc") is not None:
+            interp.mark_for_gc(t)
         return t
 
     def _getmetatable(obj=None):
@@ -631,11 +658,34 @@ def build_global_env(interp):
             raise LuaError(msg)
         return MultiRes(list(args))
 
-    def _collectgarbage(opt="collect", *args):
+    gc_state = {"running": True, "mode": "incremental", "setpause": 200, "setstepmul": 100}
+
+    def _collectgarbage(*args):
+        opt = args[0] if args and args[0] is not None else "collect"
+        if not isinstance(opt, str):
+            arg_error(1, "collectgarbage", f"string expected, got {tname(opt, 1)}")
+        if opt == "collect":
+            interp.full_gc()
+            return 0
         if opt == "count":
-            return MultiRes([float(len(gc.get_objects())) / 10.0, 0])
-        gc.collect()
-        return 0
+            return float(len(gc.get_objects())) / 10.0
+        if opt == "step":
+            interp.full_gc()
+            return True
+        if opt in ("stop", "restart"):
+            gc_state["running"] = opt == "restart"
+            return 0
+        if opt == "isrunning":
+            return gc_state["running"]
+        if opt in ("setpause", "setstepmul"):
+            prev = gc_state[opt]
+            gc_state[opt] = check_int(args[1] if len(args) > 1 else None, 2, "collectgarbage", 0)
+            return prev
+        if opt in ("incremental", "generational"):
+            prev = gc_state["mode"]
+            gc_state["mode"] = opt
+            return prev
+        arg_error(1, "collectgarbage", f"invalid option '{opt}'")
 
     # ---- table ----
     table_lib = LuaTable()
@@ -712,27 +762,80 @@ def build_global_env(interp):
         return sep.join(parts)
 
     def _table_sort(t=None, comp=None):
+        """Quicksort de ltablib.c (Lua 5.4): mismo orden de comparaciones e intercambios,
+        así que el resultado coincide con Lua incluso con elementos 'empatados'."""
         check_table(t, 1, "sort")
         n = interp._table_len(t)
-        items = [t.rawget(k) for k in range(1, n + 1)]
+        if n <= 1:
+            return MultiRes()
+        if comp is not None and not (callable(comp) and not isinstance(comp, LuaTable)):
+            arg_error(2, "sort", f"function expected, got {tname(comp, 2)}")
+        a = [None] + [interp._table_get(t, k) for k in range(1, n + 1)]
         if comp is not None:
-            def lt(a, b):
-                r = unwrap_one(interp._call_callable(comp, [a, b]))
+            def lt(x, y):
+                r = interp._call_callable(comp, [x, y])
+                if r.__class__ is MultiRes:
+                    r = r[0] if r else None
                 return r is not None and r is not False
         else:
-            def lt(a, b):
-                return interp._lua_compare("<", a, b)
+            def lt(x, y):
+                return interp._lua_compare("<", x, y)
 
-        def cmp(a, b):
-            if lt(a, b):
-                return -1
-            if lt(b, a):
-                return 1
-            return 0
+        def bad_order():
+            # luaL_error: lleva la posición del llamador de 'sort' (si es código Lua)
+            msg = "invalid order function for sorting"
+            if saved_line is not None:
+                msg = f"{interp.chunkname}:{saved_line}: {msg}"
+            raise LuaError(msg)
 
-        items.sort(key=functools.cmp_to_key(cmp))
-        for k, v in enumerate(items, start=1):
-            t.rawset(k, v)
+        def auxsort(lo, up):
+            while lo < up:
+                if lt(a[up], a[lo]):
+                    a[lo], a[up] = a[up], a[lo]
+                if up - lo == 1:
+                    break
+                p = (lo + up) // 2
+                if lt(a[p], a[lo]):
+                    a[p], a[lo] = a[lo], a[p]
+                elif lt(a[up], a[p]):
+                    a[p], a[up] = a[up], a[p]
+                if up - lo == 2:
+                    break
+                pivot = a[p]
+                a[p], a[up - 1] = a[up - 1], pivot
+                i, j = lo, up - 1
+                while True:
+                    i += 1
+                    while lt(a[i], pivot):
+                        if i == up - 1:
+                            bad_order()
+                        i += 1
+                    j -= 1
+                    while lt(pivot, a[j]):
+                        if j < i:
+                            bad_order()
+                        j -= 1
+                    if j < i:
+                        a[up - 1] = a[i]
+                        a[i] = pivot
+                        break
+                    a[i], a[j] = a[j], a[i]
+                p = i
+                if p - lo < up - p:
+                    auxsort(lo, p - 1)
+                    lo = p + 1
+                else:
+                    auxsort(p + 1, up)
+                    up = p - 1
+
+        saved_line = interp.cur_line
+        interp.cur_line = None  # los errores de comparación ocurren dentro de 'sort' (función C): sin posición
+        try:
+            auxsort(1, n)
+        finally:
+            interp.cur_line = saved_line
+        for k in range(1, n + 1):
+            interp._table_set(t, k, a[k])
         return MultiRes()
 
     def _table_move(a1, f, e, tpos, a2=None):
@@ -760,29 +863,33 @@ def build_global_env(interp):
     main_co.status = "running"
 
     def _co_create(fn=None):
-        if not callable(fn) and not isinstance(fn, LuaTable):
-            arg_error(1, "create", "function expected")
+        if not callable(fn) or isinstance(fn, LuaTable):
+            arg_error(1, "create", f"function expected, got {tname(fn, 1)}")
         return LuaCoroutine(fn, interp)
 
     def _co_resume(co=None, *args):
         if not isinstance(co, LuaCoroutine):
-            arg_error(1, "resume", "coroutine expected")
+            arg_error(1, "resume", f"coroutine expected, got {tname(co, 1)}")
         return co.resume(*args)
 
-    def _co_wrap(fn):
-        co = _co_create(fn)
+    def _co_wrap(fn=None):
+        if not callable(fn) or isinstance(fn, LuaTable):
+            arg_error(1, "wrap", f"function expected, got {tname(fn, 1)}")
+        co = LuaCoroutine(fn, interp)
 
         def wrapped(*args):
             res = co.resume(*args)
             if res[0] is True:
                 return MultiRes(list(res[1:]))
+            if isinstance(res[1], str):
+                raise interp.rt_error(res[1])  # como auxwrap: antepone la posición del llamador
             raise LuaError(res[1])
 
         return wrapped
 
     def _co_status(co=None):
         if not isinstance(co, LuaCoroutine):
-            arg_error(1, "status", "coroutine expected")
+            arg_error(1, "status", f"coroutine expected, got {tname(co, 1)}")
         return co.real_status()
 
     def _co_running():
@@ -792,7 +899,7 @@ def build_global_env(interp):
 
     def _co_close(co=None):
         if not isinstance(co, LuaCoroutine):
-            arg_error(1, "close", "coroutine expected")
+            arg_error(1, "close", f"coroutine expected, got {tname(co, 1)}")
         if co.status in ("suspended", "dead"):
             co.status = "dead"
             if co.has_error:
@@ -903,7 +1010,10 @@ def build_global_env(interp):
             return math.copysign(float("nan"), -1)
 
     def _modf(x=None):
-        x = float(check_num(x, 1, "modf"))
+        x = check_num(x, 1, "modf")
+        if isinstance(x, int):
+            return MultiRes([x, 0.0])
+        x = float(x)
         if math.isinf(x):
             return MultiRes([x, 0.0])
         fp, ip = math.modf(x)
@@ -921,33 +1031,83 @@ def build_global_env(interp):
             return _tointeger(n) if n is not None else None
         return None
 
-    def _mtype(x=None):
+    def _mtype(*args):
+        if not args:
+            arg_error(1, "type", "value expected")
+        x = args[0]
         if isinstance(x, bool):
             return None
         if isinstance(x, int):
             return "integer"
         if isinstance(x, float):
             return "float"
-        if x is None:
-            arg_error(1, "type", "value expected")
         return None
 
-    import random as _random
-    _rng = _random.Random(0)
+    # Generador xoshiro256** de lmathlib.c (Lua 5.4): con la misma semilla produce los mismos números
+    _M64 = 0xFFFFFFFFFFFFFFFF
+    _rstate = [0, 0, 0, 0]
 
-    def _random_fn(m=None, n=None):
-        if m is None:
-            return _rng.random()
-        if n is None and m == 0:
-            return wrap_int64(_rng.getrandbits(64))
-        lo, hi = (1, check_int(m, 1, "random")) if n is None else (check_int(m, 1, "random"), check_int(n, 2, "random"))
-        if lo > hi:
-            arg_error(1 if n is None else 2, "random", "interval is empty")
-        return _rng.randint(lo, hi)
+    def _rotl(x, n):
+        return ((x << n) | (x >> (64 - n))) & _M64
+
+    def _nextrand():
+        s0, s1, s2, s3 = _rstate
+        res = (_rotl((s1 * 5) & _M64, 7) * 9) & _M64
+        t = (s1 << 17) & _M64
+        s2 ^= s0
+        s3 ^= s1
+        s1 ^= s2
+        s0 ^= s3
+        s2 ^= t
+        s3 = _rotl(s3, 45)
+        _rstate[:] = [s0, s1, s2, s3]
+        return res
+
+    def _setseed(n1, n2):
+        _rstate[:] = [n1 & _M64, 0xFF, n2 & _M64, 0]
+        for _ in range(16):
+            _nextrand()
+
+    _setseed(int(time.time()) ^ id(_rstate), id(interp))
+
+    def _project(ran, n):
+        if n & (n + 1) == 0:
+            return ran & n
+        lim = n
+        for sh in (1, 2, 4, 8, 16, 32):
+            lim |= lim >> sh
+        ran &= lim
+        while ran > n:
+            ran = _nextrand() & lim
+        return ran
+
+    def _random_fn(*args):
+        rv = _nextrand()
+        if not args:
+            return (rv >> 11) * (0.5 ** 53)
+        if len(args) == 1:
+            low = 1
+            up = check_int(args[0], 1, "random")
+            if up == 0:
+                return wrap_int64(rv)
+        elif len(args) == 2:
+            low = check_int(args[0], 1, "random")
+            up = check_int(args[1], 2, "random")
+        else:
+            raise interp.rt_error("wrong number of arguments")
+        if low > up:
+            arg_error(len(args), "random", "interval is empty")
+        p = _project(rv, (up - low) & _M64)
+        return wrap_int64(p + low)
 
     def _randomseed(*args):
-        _rng.seed(args[0] if args else None)
-        return MultiRes()
+        if not args:
+            n1, n2 = int(time.time() * 1000) & _M64, id(args)
+        else:
+            n1 = check_int(args[0], 1, "randomseed") if not (isinstance(args[0], float) and not args[0].is_integer()) else int(args[0])
+            n2 = check_int(args[1], 2, "randomseed", 0) if len(args) > 1 else 0
+        _setseed(n1, n2)
+        return MultiRes([wrap_int64(n1), wrap_int64(n2)])
 
     def _ult(a, b):
         return (a & 0xFFFFFFFFFFFFFFFF) < (b & 0xFFFFFFFFFFFFFFFF)
@@ -958,7 +1118,9 @@ def build_global_env(interp):
                      ("acos", _wrap_float(math.acos, "acos")), ("exp", _wrap_float(math.exp, "exp")),
                      ("atan", lambda y=None, x=1.0: math.atan2(float(check_num(y, 1, "atan")), float(check_num(x, 2, "atan", 1.0)))),
                      ("log", _log), ("fmod", _fmod), ("modf", _modf), ("tointeger", _tointeger), ("type", _mtype),
-                     ("random", _random_fn), ("randomseed", _randomseed), ("ult", _ult)):
+                     ("random", _random_fn), ("randomseed", _randomseed), ("ult", _ult),
+                     ("deg", lambda x=None: float(check_num(x, 1, "deg")) * (180.0 / math.pi)),
+                     ("rad", lambda x=None: float(check_num(x, 1, "rad")) * (math.pi / 180.0))):
         math_lib.rawset(name, fn)
 
     # ---- string ----
@@ -1035,6 +1197,17 @@ def build_global_env(interp):
             out.append(chr(c))
         return "".join(out)
 
+    def _hexfloat(v):
+        """Equivalente a printf("%a") de C (sin ceros finales en la mantisa)."""
+        if math.isnan(v):
+            return "-nan" if math.copysign(1.0, v) < 0 else "nan"
+        if math.isinf(v):
+            return "inf" if v > 0 else "-inf"
+        mant, exp = float.hex(v).split("p")
+        if "." in mant:
+            mant = mant.rstrip("0").rstrip(".")
+        return mant + "p" + exp
+
     def _format_q(v):
         if isinstance(v, str):
             out = ['"']
@@ -1060,11 +1233,12 @@ def build_global_env(interp):
                 return "(0/0)"
             if math.isinf(v):
                 return "1e9999" if v > 0 else "-1e9999"
-            mant, exp = float.hex(v).split("p")
-            if "." in mant:
-                mant = mant.rstrip("0").rstrip(".")
-            return mant + "p" + exp
-        return lua_tostring(v)
+            return _hexfloat(v)
+        if v == MININT:
+            return "0x8000000000000000"
+        if is_number(v) or v is None or isinstance(v, bool):
+            return lua_tostring(v)
+        arg_error(2, "format", "value has no literal form")
 
     _FMT_RE = re.compile(r"%([-+ #0]*)(\d*)(?:\.(\d*))?([a-zA-Z%])")
 
@@ -1134,8 +1308,8 @@ def build_global_env(interp):
                     out.append((spec + conv) % v)
             elif conv in "aA":
                 v = float(check_num(arg, argi + 1, "format"))
-                h = float.hex(v)
-                out.append(h.upper() if conv == "A" else h)
+                h = _hexfloat(v)
+                out.append((("%" + flags.replace("0", "") + width + "s") % (h.upper() if conv == "A" else h)))
             elif conv == "s":
                 out.append((spec + "s") % tostr(arg))
             elif conv == "q":
@@ -1208,7 +1382,7 @@ def build_global_env(interp):
         s = check_str(s, 1, "gsub")
         pat = check_str(pat, 2, "gsub")
         if not (isinstance(repl, (str, LuaTable)) or is_number(repl) or callable(repl)):
-            arg_error(3, "gsub", f"string/function/table expected, got {lua_type(repl) if repl is not None else 'no value'}")
+            arg_error(3, "gsub", f"string/function/table expected, got {tname(repl, 3)}")
         ls = len(s)
         max_s = check_int(max_n, 4, "gsub") if max_n is not None else ls + 1
         anchor = pat.startswith("^")
@@ -1273,9 +1447,241 @@ def build_global_env(interp):
         out.append(s[src:])
         return MultiRes(["".join(out), n])
 
+    # ---- string.pack / string.unpack / string.packsize (§6.4.2, como lstrlib.c) ----
+    import struct as _struct
+    _MAXINTSIZE = 16
+    _NATIVE_ALIGN = 8
+
+    class _PackState:
+        def __init__(self, fmt, fname):
+            self.fmt = fmt
+            self.pos = 0
+            self.little = True
+            self.maxalign = 1
+            self.fname = fname
+
+        def getnum(self, default):
+            fmt = self.fmt
+            if self.pos >= len(fmt) or not fmt[self.pos].isdigit():
+                return default
+            a = 0
+            while self.pos < len(fmt) and fmt[self.pos].isdigit() and a <= (2 ** 31 - 10) // 10:
+                a = a * 10 + int(fmt[self.pos])
+                self.pos += 1
+            return a
+
+        def getnumlimit(self, default):
+            sz = self.getnum(default)
+            if sz > _MAXINTSIZE or sz <= 0:
+                raise interp.rt_error(f"integral size ({sz}) out of limits [1,{_MAXINTSIZE}]")
+            return sz
+
+        def getoption(self):
+            """Devuelve (opción, tamaño). Opciones: int, uint, float, double, number, char,
+            string, zstr, padding, paddalign, nop."""
+            c = self.fmt[self.pos]
+            self.pos += 1
+            if c == "b":
+                return "int", 1
+            if c == "B":
+                return "uint", 1
+            if c == "h":
+                return "int", 2
+            if c == "H":
+                return "uint", 2
+            if c in "lj":
+                return "int", 8
+            if c in "LJT":
+                return "uint", 8
+            if c == "f":
+                return "float", 4
+            if c in "nd":
+                return "double", 8
+            if c == "i":
+                return "int", self.getnumlimit(4)
+            if c == "I":
+                return "uint", self.getnumlimit(4)
+            if c == "s":
+                return "string", self.getnumlimit(8)
+            if c == "c":
+                sz = self.getnum(-1)
+                if sz == -1:
+                    raise interp.rt_error("missing size for format option 'c'")
+                return "char", sz
+            if c == "z":
+                return "zstr", 0
+            if c == "x":
+                return "padding", 1
+            if c == "X":
+                return "paddalign", 0
+            if c == " ":
+                return "nop", 0
+            if c in "<=":
+                self.little = True
+                return "nop", 0
+            if c == ">":
+                self.little = False
+                return "nop", 0
+            if c == "!":
+                self.maxalign = self.getnumlimit(_NATIVE_ALIGN)
+                return "nop", 0
+            raise interp.rt_error(f"invalid format option '{c}'")
+
+        def getdetails(self, totalsize):
+            opt, size = self.getoption()
+            align = size
+            if opt == "paddalign":
+                if self.pos >= len(self.fmt):
+                    arg_error(1, self.fname, "invalid next option for option 'X'")
+                opt2, align = self.getoption()
+                if opt2 == "char" or align == 0:
+                    arg_error(1, self.fname, "invalid next option for option 'X'")
+            ntoalign = 0
+            if align > 1 and opt in ("int", "uint", "float", "double", "paddalign"):
+                align = min(align, self.maxalign)
+                if align & (align - 1):
+                    arg_error(1, self.fname, "format asks for alignment not power of 2")
+                ntoalign = (align - (totalsize & (align - 1))) & (align - 1)
+            return opt, size, ntoalign
+
+    def _packint(n, little, size, neg):
+        n &= (1 << (8 * size)) - 1 if size <= 8 else (1 << 64) - 1
+        out = bytearray(size)
+        for i in range(min(size, 8)):
+            out[i] = n & 0xFF
+            n >>= 8
+        if neg and size > 8:
+            for i in range(8, size):
+                out[i] = 0xFF
+        if not little:
+            out.reverse()
+        return out.decode("latin-1")
+
+    def _s_pack(fmt=None, *args):
+        fmt = check_str(fmt, 1, "pack")
+        st = _PackState(fmt, "pack")
+        out = []
+        total = 0
+        argi = 0
+        while st.pos < len(fmt):
+            opt, size, ntoalign = st.getdetails(total)
+            total += ntoalign + size
+            out.append("\0" * ntoalign)
+            if opt in ("int", "uint"):
+                argn = argi + 2
+                v = check_int(args[argi] if argi < len(args) else None, argn, "pack")
+                argi += 1
+                if size < 8:
+                    if opt == "int":
+                        lim = 1 << (size * 8 - 1)
+                        if not (-lim <= v < lim):
+                            arg_error(argn, "pack", "integer overflow")
+                    elif not (0 <= (v & 0xFFFFFFFFFFFFFFFF) < (1 << (size * 8))):
+                        arg_error(argn, "pack", "unsigned overflow")
+                out.append(_packint(v, st.little, size, v < 0))
+            elif opt in ("float", "double"):
+                v = float(check_num(args[argi] if argi < len(args) else None, argi + 2, "pack"))
+                argi += 1
+                code = ("<" if st.little else ">") + ("f" if opt == "float" else "d")
+                try:
+                    out.append(_struct.pack(code, v).decode("latin-1"))
+                except OverflowError:
+                    out.append(_struct.pack(code, math.copysign(math.inf, v)).decode("latin-1"))
+            elif opt == "char":
+                s = check_str(args[argi] if argi < len(args) else None, argi + 2, "pack")
+                if len(s) > size:
+                    arg_error(argi + 2, "pack", "string longer than given size")
+                argi += 1
+                out.append(s + "\0" * (size - len(s)))
+            elif opt == "string":
+                s = check_str(args[argi] if argi < len(args) else None, argi + 2, "pack")
+                if size < 8 and len(s) >= (1 << (size * 8)):
+                    arg_error(argi + 2, "pack", "string length does not fit in given size")
+                argi += 1
+                out.append(_packint(len(s), st.little, size, False))
+                out.append(s)
+                total += len(s)
+            elif opt == "zstr":
+                s = check_str(args[argi] if argi < len(args) else None, argi + 2, "pack")
+                if "\0" in s:
+                    arg_error(argi + 2, "pack", "string contains zeros")
+                argi += 1
+                out.append(s + "\0")
+                total += len(s) + 1
+            elif opt == "padding":
+                out.append("\0")
+        return "".join(out)
+
+    def _s_packsize(fmt=None):
+        fmt = check_str(fmt, 1, "packsize")
+        st = _PackState(fmt, "packsize")
+        total = 0
+        while st.pos < len(fmt):
+            opt, size, ntoalign = st.getdetails(total)
+            if opt in ("string", "zstr"):
+                arg_error(1, "packsize", "variable-length format")
+            total += ntoalign + size
+        return total
+
+    def _unpackint(s, little, size, signed):
+        b = s.encode("latin-1")
+        if not little:
+            b = b[::-1]
+        res = 0
+        for i in range(min(size, 8) - 1, -1, -1):
+            res = (res << 8) | b[i]
+        if size < 8:
+            if signed:
+                mask = 1 << (size * 8 - 1)
+                res = (res ^ mask) - mask
+        elif size > 8:
+            mask = 0xFF if (signed and res >> 63) else 0
+            for i in range(8, size):
+                if b[i] != mask:
+                    raise interp.rt_error(f"{size}-byte integer does not fit into Lua Integer")
+        return wrap_int64(res)
+
+    def _s_unpack(fmt=None, data=None, init=None):
+        fmt = check_str(fmt, 1, "unpack")
+        data = check_str(data, 2, "unpack")
+        ld = len(data)
+        pos = posrelat_start(check_int(init, 3, "unpack", 1), ld) - 1
+        if not (0 <= pos <= ld):
+            arg_error(3, "unpack", "initial position out of string")
+        st = _PackState(fmt, "unpack")
+        out = []
+        while st.pos < len(fmt):
+            opt, size, ntoalign = st.getdetails(pos)
+            if ntoalign + size > ld - pos:
+                arg_error(2, "unpack", "data string too short")
+            pos += ntoalign
+            if opt in ("int", "uint"):
+                out.append(_unpackint(data[pos:pos + size], st.little, size, opt == "int"))
+            elif opt in ("float", "double"):
+                code = ("<" if st.little else ">") + ("f" if opt == "float" else "d")
+                out.append(_struct.unpack(code, data[pos:pos + size].encode("latin-1"))[0])
+            elif opt == "char":
+                out.append(data[pos:pos + size])
+            elif opt == "string":
+                ln = _unpackint(data[pos:pos + size], st.little, size, False)
+                if ln < 0 or ln > ld - pos - size:
+                    arg_error(2, "unpack", "data string too short")
+                out.append(data[pos + size:pos + size + ln])
+                pos += ln
+            elif opt == "zstr":
+                end = data.find("\0", pos)
+                if end < 0:
+                    arg_error(2, "unpack", "unfinished string for format 'z'")
+                out.append(data[pos:end])
+                pos = end + 1 - size
+            pos += size
+        out.append(pos + 1)
+        return MultiRes(out)
+
     for name, fn in (("len", _s_len), ("sub", _s_sub), ("upper", _s_upper), ("lower", _s_lower), ("rep", _s_rep),
                      ("reverse", _s_reverse), ("byte", _s_byte), ("char", _s_char), ("format", _s_format),
-                     ("find", _s_find), ("match", _s_match), ("gmatch", _s_gmatch), ("gsub", _s_gsub)):
+                     ("find", _s_find), ("match", _s_match), ("gmatch", _s_gmatch), ("gsub", _s_gsub),
+                     ("pack", _s_pack), ("unpack", _s_unpack), ("packsize", _s_packsize)):
         string_lib.rawset(name, fn)
 
     # ---- os ----
@@ -1426,9 +1832,65 @@ def build_global_env(interp):
             start += dec[1]
         return MultiRes(out)
 
+    def _iscont(s, i):
+        return i < len(s) and (ord(s[i]) & 0xC0) == 0x80
+
+    def _utf8_codes(s=None, lax=None):
+        s = check_str(s, 1, "codes")
+        if _iscont(s, 0):
+            arg_error(1, "codes", "invalid UTF-8 code")
+
+        def _codes_iter(_s=None, ctrl=0):
+            n = ctrl if isinstance(ctrl, int) else 0
+            ls = len(s)
+            if 0 <= n < ls:
+                while _iscont(s, n):
+                    n += 1
+            if n >= ls or n < 0:
+                return None
+            dec = _utf8_decode(s, n)
+            if dec is None or _iscont(s, n + dec[1]):
+                raise interp.rt_error("invalid UTF-8 code")
+            return MultiRes([n + 1, dec[0]])
+
+        return MultiRes([_codes_iter, s, 0])
+
+    def _utf8_offset(s=None, n=None, i=None):
+        s = check_str(s, 1, "offset")
+        n = check_int(n, 2, "offset")
+        ls = len(s)
+        posi = check_int(i, 3, "offset") if i is not None else (1 if n >= 0 else ls + 1)
+        if posi < 0:
+            posi = 0 if -posi > ls else ls + posi + 1
+        if not (1 <= posi and posi - 1 <= ls):
+            arg_error(3, "offset", "position out of bounds")
+        posi -= 1
+        if n == 0:
+            while posi > 0 and _iscont(s, posi):
+                posi -= 1
+            return posi + 1
+        if _iscont(s, posi):
+            raise interp.rt_error("initial position is a continuation byte")
+        if n < 0:
+            while n < 0 and posi > 0:
+                posi -= 1
+                while posi > 0 and _iscont(s, posi):
+                    posi -= 1
+                n += 1
+        else:
+            n -= 1
+            while n > 0 and posi < ls:
+                posi += 1
+                while _iscont(s, posi):
+                    posi += 1
+                n -= 1
+        return posi + 1 if n == 0 else None
+
     utf8_lib.rawset("char", _utf8_char)
     utf8_lib.rawset("len", _utf8_len)
     utf8_lib.rawset("codepoint", _utf8_codepoint)
+    utf8_lib.rawset("codes", _utf8_codes)
+    utf8_lib.rawset("offset", _utf8_offset)
     utf8_lib.rawset("charpattern", "[\x00-\x7F\xC2-\xFD][\x80-\xBF]*")
 
     # ---- registro en _G ----

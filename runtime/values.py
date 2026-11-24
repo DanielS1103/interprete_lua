@@ -148,3 +148,18 @@ class LuaTable:
             h += 1
         self.hint = h
         return h
+
+# ---------------------------------------------------------------------------
+# Finalizadores (__gc): una tabla cuya metatabla tiene '__gc' al llamar a setmetatable
+# pasa a ser LuaTableGC. Cuando Python detecta que es inalcanzable llama a __del__, que la
+# "resucita" en GC_READY; el finalizador Lua se ejecuta en el siguiente collectgarbage()
+# o al terminar el programa (como lua_close).
+# ---------------------------------------------------------------------------
+GC_READY = []
+GC_CLOSED = [False]
+
+
+class LuaTableGC(LuaTable):
+    def __del__(self):
+        if not GC_CLOSED[0] and not getattr(self, "_gc_done", False):
+            GC_READY.append(self)

@@ -1,9 +1,11 @@
 import re
 import math
 from grammar.LuaParserVisitor import LuaParserVisitor
-from runtime.values import LuaTable, MultiRes, unwrap_one, expand_args
+import gc
+import weakref
+from runtime.values import LuaTable, LuaTableGC, MultiRes, unwrap_one, expand_args, GC_READY, GC_CLOSED
 from runtime.environment import Environment
-from runtime.exceptions import LuaReturn, LuaBreak, LuaGoto, LuaError
+from runtime.exceptions import LuaReturn, LuaBreak, LuaGoto, LuaError, LuaTailCall, make_lua_error
 from runtime.stdlib import (build_global_env, lua_tostring, lua_type, str2number,
                             wrap_int64, is_number, LuaFile, MAXINT, MININT)
 
@@ -22,46 +24,63 @@ class LuaFunction:
         return self.call(args)
 
     def call(self, args):
-        """Invoca la función Lua (se usa en vez de __call__ para no consumir recursión de C)."""
-        interp = self.interp
-        fn_env = Environment(parent=self.closure_env, env_table=self.closure_env.env_table)
-        fn_env.is_func = True
-        params = self.params
-        nargs = len(args)
-        vars_ = fn_env.vars
-        for i, p_name in enumerate(params):
-            vars_[p_name] = args[i] if i < nargs else None
-        if self.is_vararg:
-            vars_["..."] = MultiRes(args[len(params):])
+        """Invoca la función Lua (se usa en vez de __call__ para no consumir recursión de C).
 
-        prev_env = interp.current_env
-        prev_line = interp.cur_line
-        prev_chunk = interp.chunkname
-        interp.chunkname = self.chunkname
-        interp.call_lines.append(prev_line)
-        interp.current_env = fn_env
-        err = None
-        try:
-            interp.visitBlock(self.block_ctx, create_scope=False)
-            return MultiRes()
-        except LuaReturn as ret:
-            vals = ret.values
-            if len(vals) == 1:
-                return vals[0]
-            return MultiRes(vals)
-        except LuaError as e:
-            err = e.lua_obj
-            raise
-        finally:
+        Las llamadas de cola ('return g(x)') llegan como LuaTailCall: el marco actual se
+        libera (finally) y el bucle continúa con 'g', sin crecer la pila de Python.
+        """
+        func = self
+        interp = self.interp
+        while True:
+            closure_env = func.closure_env
+            fn_env = Environment(parent=closure_env, env_table=closure_env.env_table)
+            fn_env.is_func = True
+            params = func.params
+            nargs = len(args)
+            vars_ = fn_env.vars
+            for i, p_name in enumerate(params):
+                vars_[p_name] = args[i] if i < nargs else None
+            if func.is_vararg:
+                vars_["..."] = MultiRes(args[len(params):])
+
+            prev_env = interp.current_env
+            prev_line = interp.cur_line
+            prev_chunk = interp.chunkname
+            interp.chunkname = func.chunkname
+            interp.call_lines.append(prev_line)
+            interp.current_env = fn_env
+            err = None
             try:
-                if fn_env.to_close:
-                    fn_env.close_scope(interp._call_metamethod, err)
+                interp.visitBlock(func.block_ctx, create_scope=False)
+                return MultiRes()
+            except LuaReturn as ret:
+                vals = ret.values
+                if len(vals) == 1:
+                    return vals[0]
+                return MultiRes(vals)
+            except LuaTailCall as tc:
+                func = tc.fn
+                args = tc.args
+                continue
+            except LuaError as e:
+                err = e.lua_obj
+                raise
+            except RecursionError:
+                # pila agotada: se convierte en el error de Lua con la posición de la llamada
+                line = interp.cur_line
+                msg = "stack overflow" if line is None else f"{interp.chunkname}:{line}: stack overflow"
+                err = msg
+                raise make_lua_error(msg)
             finally:
-                interp.current_env = prev_env
-                if interp.call_lines:
-                    interp.call_lines.pop()
-                interp.cur_line = prev_line
-                interp.chunkname = prev_chunk
+                try:
+                    if fn_env.to_close:
+                        fn_env.close_scope(interp._call_metamethod, err)
+                finally:
+                    interp.current_env = prev_env
+                    if interp.call_lines:
+                        interp.call_lines.pop()
+                    interp.cur_line = prev_line
+                    interp.chunkname = prev_chunk
 
 class LuaInterpreter(LuaParserVisitor):
     def __init__(self):
@@ -71,6 +90,57 @@ class LuaInterpreter(LuaParserVisitor):
         self.chunkname = "input"
         self.cur_line = 0
         self.call_lines = []
+        self.nargs = 0
+        self.gc_seq = 0
+        self.gc_marked = []
+
+    # --- Recolección de basura y finalizadores (__gc) ---
+    def mark_for_gc(self, t):
+        """setmetatable con '__gc': la tabla queda marcada para finalización."""
+        if getattr(t, "_gc_seq", None) is not None:
+            return
+        if t.__class__ is LuaTable:
+            t.__class__ = LuaTableGC
+        self.gc_seq += 1
+        t._gc_seq = self.gc_seq
+        self.gc_marked.append(weakref.ref(t))
+
+    def _run_finalizers(self, objs):
+        # orden inverso al de marcado, cada objeto una sola vez
+        for o in sorted(objs, key=lambda o: -o._gc_seq):
+            if getattr(o, "_gc_done", False):
+                continue
+            o._gc_done = True
+            mm = self._get_metamethod(o, "__gc")
+            if mm is None or mm is False:
+                continue
+            saved_line = self.cur_line
+            try:
+                self._call_callable(mm, [o])
+            except (LuaError, RecursionError):
+                pass  # Lua solo emite un warning (desactivado por defecto)
+            finally:
+                self.cur_line = saved_line
+
+    def full_gc(self):
+        gc.collect()
+        while GC_READY:
+            ready = list(GC_READY)
+            del GC_READY[:]
+            self._run_finalizers(ready)
+            gc.collect()
+
+    def close_state(self):
+        """Al terminar el programa se llaman todos los finalizadores pendientes (lua_close)."""
+        gc.collect()
+        objs = list(GC_READY)
+        del GC_READY[:]
+        for r in self.gc_marked:
+            o = r()
+            if o is not None:
+                objs.append(o)
+        GC_CLOSED[0] = True
+        self._run_finalizers(objs)
 
     def rt_error(self, msg, level=1):
         """Crea un LuaError con prefijo 'chunk:línea:' como lo hace Lua para errores de ejecución."""
@@ -98,8 +168,8 @@ class LuaInterpreter(LuaParserVisitor):
     def _to_int64(self, val, ctx=None):
         if isinstance(val, int) and not isinstance(val, bool):
             return wrap_int64(val)
-        if isinstance(val, float) and not math.isnan(val) and not math.isinf(val) and val.is_integer():
-            return wrap_int64(int(val))
+        if isinstance(val, float) and -9.2233720368547758e18 <= val < 9.2233720368547758e18 and val.is_integer():
+            return int(val)
         if isinstance(val, float):
             raise self.rt_error("number has no integer representation")
         suffix = self._desc_suffix(self._exp_desc(ctx)) if ctx is not None else ""
@@ -123,6 +193,7 @@ class LuaInterpreter(LuaParserVisitor):
         if type(fn) is LuaFunction:
             return fn.call(args)
         if callable(fn):
+            self.nargs = len(args)  # para distinguir "got nil" de "got no value" en los builtins
             return fn(*args)
         if isinstance(fn, LuaTable):
             mm = self._get_metamethod(fn, "__call")
@@ -258,10 +329,22 @@ class LuaInterpreter(LuaParserVisitor):
 
     # --- Reglas de bloques y sentencias ---
     def visitChunk(self, ctx):
+        chunk_env = self.current_env
+        err = None
         try:
             self.visitBlock(ctx.block(), create_scope=False)
         except LuaReturn as ret:
             return MultiRes(ret.values) if len(ret.values) > 1 else (ret.values[0] if ret.values else None)
+        except LuaTailCall as tc:
+            return tc.fn.call(tc.args)
+        except LuaError as e:
+            err = e.lua_obj
+            raise
+        finally:
+            # variables <close> del nivel superior: se cierran al terminar el chunk (o por error)
+            if chunk_env.to_close:
+                self.current_env = chunk_env
+                chunk_env.close_scope(self._call_metamethod, err)
         return None
 
     def visitBlock(self, ctx, create_scope=True):
@@ -310,27 +393,83 @@ class LuaInterpreter(LuaParserVisitor):
         if exps is None:
             exps = ctx._exps = ctx.explist().exp() if ctx.explist() else []
         if len(exps) == 1:
-            val = self.visit(exps[0])
+            tc = ctx.__dict__.get("_tc", 0)
+            if tc == 0:
+                tc = ctx._tc = self._tailcall_info(exps[0])
+            if tc is not None and self._can_tailcall():
+                prefix_nodes, method, args_node = tc
+                if method is None:
+                    fn, desc = self._eval_chain(prefix_nodes)
+                    fn = unwrap_one(fn)
+                    args = self._eval_args(args_node)
+                else:
+                    target, tdesc = self._eval_chain(prefix_nodes)
+                    target = unwrap_one(target)
+                    if not isinstance(target, (LuaTable, str, LuaFile)):
+                        raise self.rt_error(f"attempt to index a {lua_type(target)} value{self._desc_suffix(tdesc)}")
+                    fn = self._table_get(target, method)
+                    args = [target] + self._eval_args(args_node)
+                    desc = ("method", method)
+                if type(fn) is LuaFunction:
+                    raise LuaTailCall(fn, args)
+                val = self._call_callable(fn, args, desc)
+            else:
+                val = self.visitExp(exps[0])
             raise LuaReturn(list(val) if isinstance(val, MultiRes) else [val])
-        raise LuaReturn(expand_args([self.visit(e) for e in exps]))
+        raise LuaReturn(expand_args([self.visitExp(e) for e in exps]))
+
+    @staticmethod
+    def _tailcall_info(exp_ctx):
+        """Si la expresión es exactamente una llamada 'f(args)' u 'o:m(args)' (sin paréntesis
+        alrededor), devuelve (nodos del prefijo, nombre de método o None, nodo args)."""
+        pe = exp_ctx.prefixexp() if hasattr(exp_ctx, "prefixexp") else None
+        if pe is None or pe.getChildCount() != 1:
+            return None
+        fc = pe.getChild(0)
+        if type(fc).__name__ != "FunctioncallContext":
+            return None
+        nodes = list(fc.children)
+        if len(nodes) >= 3 and nodes[-3].getChildCount() == 0 and nodes[-3].getText() == ":":
+            return (nodes[:-3], nodes[-2].getText(), nodes[-1])
+        return (nodes[:-1], None, nodes[-1])
+
+    def _can_tailcall(self):
+        """No hay llamada de cola dentro del ámbito de una variable <close> (§3.4.10)."""
+        env = self.current_env
+        while env is not None:
+            if env.to_close:
+                return False
+            if env.is_func:
+                return True
+            env = env.parent
+        return True
 
     def _resolve_lvalue(self, var_ctx):
-        children = list(var_ctx.children)
-        if len(children) == 1:
-            return ("var", children[0].getText())
-        if children[-1].getChildCount() == 0 and children[-1].getText() == "]":
-            target, desc = self._eval_chain(children[:-3])
-            key = unwrap_one(self.visit(children[-2]))
-            return ("table", unwrap_one(target), key, desc)
-        # Caso prefix '.' NAME
-        target, desc = self._eval_chain(children[:-2])
-        key = children[-1].getText()
+        info = var_ctx.__dict__.get("_lv")
+        if info is None:
+            ch = var_ctx.children
+            if len(ch) == 1:
+                info = ("var", ch[0].getText())
+            elif ch[-1].getChildCount() == 0 and ch[-1].getText() == "]":
+                info = ("idx", ch[:-3], ch[-2])
+            else:
+                info = ("dot", ch[:-2], ch[-1].getText())
+            var_ctx._lv = info
+        if info[0] == "var":
+            return info
+        target, desc = self._eval_chain(info[1])
+        key = unwrap_one(self.visitExp(info[2])) if info[0] == "idx" else info[2]
         return ("table", unwrap_one(target), key, desc)
 
     def _stat_info(self, ctx):
         """Clasifica una sentencia una sola vez y guarda sus sub-contextos (el árbol es inmutable)."""
         if ctx.varlist():
-            return ("assign", ctx.varlist().var(), ctx.explist().exp())
+            lvars = ctx.varlist().var()
+            exps = ctx.explist().exp()
+            plain = None
+            if len(lvars) == 1 and len(exps) == 1 and len(lvars[0].children) == 1:
+                plain = lvars[0].children[0].getText()
+            return ("assign", lvars, exps, plain)
         if ctx.functioncall():
             return ("call", ctx.functioncall())
         child0 = ctx.getChild(0)
@@ -376,17 +515,23 @@ class LuaInterpreter(LuaParserVisitor):
         kind = k[0]
 
         if kind == "assign":
+            if k[3] is not None:
+                val = self.visitExp(k[2][0])
+                if val.__class__ is MultiRes:
+                    val = val[0] if val else None
+                self.current_env.assign(k[3], val, self._table_set)
+                return None
             lvars, exps = k[1], k[2]
             if len(lvars) == 1 and len(exps) == 1:
                 # caso frecuente: una variable = una expresión
                 lv = self._resolve_lvalue(lvars[0])
-                val = unwrap_one(self.visit(exps[0]))
+                val = unwrap_one(self.visitExp(exps[0]))
                 rvalues = None
                 lvalues = (lv,)
                 rvalues = (val,)
             else:
                 lvalues = [self._resolve_lvalue(v) for v in lvars]
-                rvalues = expand_args([self.visit(e) for e in exps])
+                rvalues = expand_args([self.visitExp(e) for e in exps])
             nr = len(rvalues)
             for idx, lv in enumerate(lvalues):
                 val = rvalues[idx] if idx < nr else None
@@ -399,25 +544,31 @@ class LuaInterpreter(LuaParserVisitor):
             return None
 
         if kind == "call":
-            self.visit(k[1])
+            self.visitFunctioncall(k[1])
             return None
 
         if kind == "local":
             att_items, exps = k[1], k[2]
             if len(att_items) == 1 and len(exps) == 1:
                 vname, attr = att_items[0]
-                self.current_env.define_local(vname, unwrap_one(self.visit(exps[0])), attrib=attr)
+                val = unwrap_one(self.visitExp(exps[0]))
+                if attr is not None:
+                    self._check_attrib(vname, attr, val)
+                self.current_env.define_local(vname, val, attrib=attr)
                 return None
-            rvalues = expand_args([self.visit(e) for e in exps]) if exps else []
+            rvalues = expand_args([self.visitExp(e) for e in exps]) if exps else []
             nr = len(rvalues)
             for idx, (vname, attr) in enumerate(att_items):
-                self.current_env.define_local(vname, rvalues[idx] if idx < nr else None, attrib=attr)
+                val = rvalues[idx] if idx < nr else None
+                if attr is not None:
+                    self._check_attrib(vname, attr, val)
+                self.current_env.define_local(vname, val, attrib=attr)
             return None
 
         if kind == "if":
             exps, blocks = k[1], k[2]
             for i, cond_exp in enumerate(exps):
-                v = self.visit(cond_exp)
+                v = self.visitExp(cond_exp)
                 if v.__class__ is MultiRes:
                     v = unwrap_one(v)
                 if v is not None and v is not False:
@@ -442,36 +593,41 @@ class LuaInterpreter(LuaParserVisitor):
 
         if kind == "while":
             cond_ctx, body = k[1], k[2]
-            while self._is_truthy(unwrap_one(self.visit(cond_ctx))):
-                try:
-                    self.visitBlock(body, create_scope=True)
-                except LuaBreak:
+            reuse = not self._makes_closures(body)
+            loop_env = None
+            while True:
+                c = self.visitExp(cond_ctx)
+                if c.__class__ is MultiRes:
+                    c = c[0] if c else None
+                if c is None or c is False:
+                    break
+                if loop_env is None or not reuse:
+                    loop_env = Environment(parent=self.current_env, env_table=self.current_env.env_table)
+                else:
+                    loop_env.reset_for_iteration()
+                if self._run_loop_body(body, loop_env):
                     break
             return None
 
         if kind == "repeat":
             body, cond_ctx = k[1], k[2]
+            reuse = not self._makes_closures(body) and not self._makes_closures(cond_ctx)
+            loop_env = None
             while True:
-                loop_env = Environment(parent=self.current_env, env_table=self.current_env.env_table)
-                self.current_env = loop_env
-                try:
-                    self.visitBlock(body, create_scope=False)
-                    cond = self._is_truthy(unwrap_one(self.visit(cond_ctx)))
-                    if cond:
-                        break
-                except LuaBreak:
+                if loop_env is None or not reuse:
+                    loop_env = Environment(parent=self.current_env, env_table=self.current_env.env_table)
+                else:
+                    loop_env.reset_for_iteration()
+                if self._run_loop_body(body, loop_env, cond_ctx):
                     break
-                finally:
-                    self.current_env = loop_env.parent
-                    loop_env.close_scope(self._call_metamethod)
             return None
 
         if kind == "fornum":
             # for NAME '=' exp ',' exp (',' exp)? 'do' block 'end'
             var_name, exps, body = k[1], k[2], k[3]
-            start = unwrap_one(self.visit(exps[0]))
-            limit = unwrap_one(self.visit(exps[1]))
-            step = unwrap_one(self.visit(exps[2])) if len(exps) > 2 else 1
+            start = unwrap_one(self.visitExp(exps[0]))
+            limit = unwrap_one(self.visitExp(exps[1]))
+            step = unwrap_one(self.visitExp(exps[2])) if len(exps) > 2 else 1
             for what, v in (("initial value", start), ("limit", limit), ("step", step)):
                 if not is_number(v):
                     raise self.rt_error(f"'for' {what} must be a number")
@@ -489,49 +645,54 @@ class LuaInterpreter(LuaParserVisitor):
                     limit = MININT
                 else:
                     limit = math.floor(limit) if step > 0 else math.ceil(limit)
+            reuse = not self._makes_closures(body)
+            loop_env = None
             curr = start
             while (step > 0 and curr <= limit) or (step < 0 and curr >= limit):
-                loop_env = Environment(parent=self.current_env, env_table=self.current_env.env_table)
+                if loop_env is None or not reuse:
+                    loop_env = Environment(parent=self.current_env, env_table=self.current_env.env_table)
+                else:
+                    loop_env.reset_for_iteration()
                 loop_env.vars[var_name] = curr
-                self.current_env = loop_env
-                try:
-                    self.visitBlock(body, create_scope=False)
-                except LuaBreak:
+                if self._run_loop_body(body, loop_env):
                     break
-                finally:
-                    self.current_env = loop_env.parent
-                    if loop_env.to_close:
-                        loop_env.close_scope(self._call_metamethod)
                 curr += step
-                if isinstance(curr, int) and not (MININT <= curr <= MAXINT):
+                if curr.__class__ is int and not (MININT <= curr <= MAXINT):
                     break
             return None
 
         if kind == "forgen":
             # for namelist 'in' explist 'do' block 'end'
             names, exps, body = k[1], k[2], k[3]
-            it_vals = expand_args([self.visit(e) for e in exps])
+            it_vals = expand_args([self.visitExp(e) for e in exps])
             iter_fn = it_vals[0] if len(it_vals) > 0 else None
             state = it_vals[1] if len(it_vals) > 1 else None
             ctrl = it_vals[2] if len(it_vals) > 2 else None
+            reuse = not self._makes_closures(body)
+            loop_env = None
+            nnames = len(names)
+            desc = ("for iterator", "for iterator")
             while True:
-                res = self._call_callable(iter_fn, [state, ctrl])
-                row = list(res) if isinstance(res, MultiRes) else [res]
-                if not row or row[0] is None:
-                    break
+                res = self._call_callable(iter_fn, [state, ctrl], desc)
+                if res.__class__ is MultiRes:
+                    if not res or res[0] is None:
+                        break
+                    row = res
+                else:
+                    if res is None:
+                        break
+                    row = (res,)
                 ctrl = row[0]
-                loop_env = Environment(parent=self.current_env, env_table=self.current_env.env_table)
-                for idx, n in enumerate(names):
-                    loop_env.vars[n] = row[idx] if idx < len(row) else None
-                self.current_env = loop_env
-                try:
-                    self.visitBlock(body, create_scope=False)
-                except LuaBreak:
+                if loop_env is None or not reuse:
+                    loop_env = Environment(parent=self.current_env, env_table=self.current_env.env_table)
+                else:
+                    loop_env.reset_for_iteration()
+                vars_ = loop_env.vars
+                nrow = len(row)
+                for idx in range(nnames):
+                    vars_[names[idx]] = row[idx] if idx < nrow else None
+                if self._run_loop_body(body, loop_env):
                     break
-                finally:
-                    self.current_env = loop_env.parent
-                    if loop_env.to_close:
-                        loop_env.close_scope(self._call_metamethod)
             return None
 
         if kind == "function":
@@ -555,6 +716,56 @@ class LuaInterpreter(LuaParserVisitor):
 
         return None
 
+    def _check_attrib(self, vname, attr, val):
+        if attr == "const":
+            return
+        if attr != "close":
+            raise self.rt_error(f"unknown attribute '{attr}'")
+        if val is not None and val is not False and self._get_metamethod(val, "__close") is None:
+            raise self.rt_error(f"variable '{vname}' got a non-closable value")
+
+    def _run_loop_body(self, body, loop_env, until_ctx=None):
+        """Ejecuta una iteración en 'loop_env'. Devuelve True si el bucle debe terminar
+        ('break', o la condición de 'repeat ... until' que ve los locales del cuerpo)."""
+        self.current_env = loop_env
+        err = None
+        try:
+            self.visitBlock(body, create_scope=False)
+            if until_ctx is not None:
+                c = self.visitExp(until_ctx)
+                if c.__class__ is MultiRes:
+                    c = c[0] if c else None
+                return c is not None and c is not False
+            return False
+        except LuaBreak:
+            return True
+        except LuaError as e:
+            err = e.lua_obj
+            raise
+        finally:
+            self.current_env = loop_env.parent
+            if loop_env.to_close:
+                loop_env.close_scope(self._call_metamethod, err)
+
+    @staticmethod
+    def _makes_closures(node):
+        """¿El subárbol define funciones? Si no, el ámbito de cada iteración de un bucle se
+        puede reutilizar (ningún closure puede observar que es el mismo objeto)."""
+        r = node.__dict__.get("_mkcl")
+        if r is None:
+            r = False
+            stack = [node]
+            while stack:
+                n = stack.pop()
+                if type(n).__name__ == "FuncbodyContext":
+                    r = True
+                    break
+                ch = getattr(n, "children", None)
+                if ch:
+                    stack.extend(ch)
+            node._mkcl = r
+        return r
+
     # --- Funciones y llamadas ---
     def _build_function(self, funcbody_ctx, inject_self=False):
         params = ["self"] if inject_self else []
@@ -565,6 +776,8 @@ class LuaInterpreter(LuaParserVisitor):
                 params.extend(n.getText() for n in plist.namelist().NAME())
             if "..." in plist.getText():
                 is_vararg = True
+        if "_ENV" in params:
+            Environment.env_shadowed = True
         return LuaFunction(params, is_vararg, funcbody_ctx.block(), self.current_env, self)
 
     def visitFunctiondef(self, ctx):
@@ -585,11 +798,11 @@ class LuaInterpreter(LuaParserVisitor):
         kind, payload = info
         if kind == "exps":
             if len(payload) == 1:
-                v = payload[0].accept(self)
+                v = self.visitExp(payload[0])
                 return list(v) if v.__class__ is MultiRes else [v]
-            return expand_args([e.accept(self) for e in payload])
+            return expand_args([self.visitExp(e) for e in payload])
         if kind == "table":
-            return [self.visit(payload)]
+            return [self.visitTableconstructor(payload)]
         if kind == "str":
             return [payload]
         return []
@@ -670,16 +883,16 @@ class LuaInterpreter(LuaParserVisitor):
                 i += 1
                 continue
             if text == "(":
-                curr = unwrap_one(self.visit(nodes[i + 1]))
+                curr = unwrap_one(self.visitExp(nodes[i + 1]))
                 desc = None
                 i += 3  # salta '(', exp, ')'
             elif text == "[":
                 key_ctx = nodes[i + 1]
-                key = unwrap_one(self.visit(key_ctx))
+                key = unwrap_one(self.visitExp(key_ctx))
                 target = unwrap_one(curr)
                 if target.__class__ is LuaTable:
                     curr = self._table_get(target, key)
-                elif isinstance(target, (str, LuaFile)):
+                elif isinstance(target, (LuaTable, str, LuaFile)):
                     curr = self._table_get(target, key)
                 else:
                     raise self.rt_error(f"attempt to index a {lua_type(target)} value{self._desc_suffix(desc)}")
@@ -690,7 +903,7 @@ class LuaInterpreter(LuaParserVisitor):
                 target = unwrap_one(curr)
                 if target.__class__ is LuaTable:
                     curr = self._table_get(target, key)
-                elif isinstance(target, (str, LuaFile)):
+                elif isinstance(target, (LuaTable, str, LuaFile)):
                     curr = self._table_get(target, key)
                 else:
                     raise self.rt_error(f"attempt to index a {lua_type(target)} value{self._desc_suffix(desc)}")
@@ -713,17 +926,14 @@ class LuaInterpreter(LuaParserVisitor):
                 i += 1
         return curr, desc
 
-    def _eval_chain_nodes(self, nodes):
-        return self._eval_chain(nodes)[0]
-
     def visitVar(self, ctx):
-        return self._eval_chain_nodes(list(ctx.children))
+        return self._eval_chain(ctx.children)[0]
 
     def visitPrefixexp(self, ctx):
-        return self._eval_chain_nodes(list(ctx.children))
+        return self._eval_chain(ctx.children)[0]
 
     def visitFunctioncall(self, ctx):
-        return self._eval_chain_nodes(list(ctx.children))
+        return self._eval_chain(ctx.children)[0]
 
     # --- Tablas ---
     def visitTableconstructor(self, ctx):
@@ -737,8 +947,8 @@ class LuaInterpreter(LuaParserVisitor):
             is_last = (idx == len(fields) - 1)
             c0 = f.getChild(0)
             if c0.getChildCount() == 0 and c0.getText() == "[":
-                k = unwrap_one(self.visit(f.exp(0)))
-                v = unwrap_one(self.visit(f.exp(1)))
+                k = unwrap_one(self.visitExp(f.exp(0)))
+                v = unwrap_one(self.visitExp(f.exp(1)))
                 if k is None:
                     raise self.rt_error("table index is nil")
                 if k.__class__ is float and k != k:
@@ -746,10 +956,10 @@ class LuaInterpreter(LuaParserVisitor):
                 tbl.rawset(k, v)
             elif f.NAME() is not None:
                 k = f.NAME().getText()
-                v = unwrap_one(self.visit(f.exp(0)))
+                v = unwrap_one(self.visitExp(f.exp(0)))
                 tbl.rawset(k, v)
             else:
-                val = self.visit(f.exp(0))
+                val = self.visitExp(f.exp(0))
                 if is_last and isinstance(val, MultiRes):
                     for item in val:
                         tbl.rawset(array_idx, item)
@@ -780,9 +990,16 @@ class LuaInterpreter(LuaParserVisitor):
                 return ("const", self._parse_number(ctx.number().getText()))
             if ctx.string():
                 return ("const", self._parse_string(ctx.string().getText()))
-            sub = ctx.functiondef() or ctx.prefixexp() or ctx.tableconstructor()
-            if sub is not None:
-                return ("sub", sub)
+            pe = ctx.prefixexp()
+            if pe is not None:
+                ch = pe.children
+                if len(ch) == 1 and ch[0].getChildCount() == 0:
+                    return ("name", ch[0].getText())  # variable simple: camino rápido
+                return ("sub", pe, self.visitPrefixexp)
+            if ctx.functiondef() is not None:
+                return ("sub", ctx.functiondef(), self.visitFunctiondef)
+            if ctx.tableconstructor() is not None:
+                return ("sub", ctx.tableconstructor(), self.visitTableconstructor)
         exps = ctx.exp()
         if len(exps) == 1:
             return ("unary", ctx.getChild(0).getText(), exps)
@@ -797,28 +1014,30 @@ class LuaInterpreter(LuaParserVisitor):
         kind = info[0]
         if kind == "const":
             return info[1]
+        if kind == "name":
+            return self.current_env.get(info[1], self._table_get)
         if kind == "sub":
-            return info[1].accept(self)
+            return info[2](info[1])
         if kind == "binary":
             op, exps = info[1], info[2]
             if op == "and":
-                left = exps[0].accept(self)
+                left = self.visitExp(exps[0])
                 if left.__class__ is MultiRes:
                     left = left[0] if left else None
                 if left is None or left is False:
                     return left
-                return unwrap_one(exps[1].accept(self))
+                return unwrap_one(self.visitExp(exps[1]))
             if op == "or":
-                left = exps[0].accept(self)
+                left = self.visitExp(exps[0])
                 if left.__class__ is MultiRes:
                     left = left[0] if left else None
                 if left is not None and left is not False:
                     return left
-                return unwrap_one(exps[1].accept(self))
-            left = exps[0].accept(self)
+                return unwrap_one(self.visitExp(exps[1]))
+            left = self.visitExp(exps[0])
             if left.__class__ is MultiRes:
                 left = left[0] if left else None
-            right = exps[1].accept(self)
+            right = self.visitExp(exps[1])
             if right.__class__ is MultiRes:
                 right = right[0] if right else None
             tl = left.__class__
@@ -843,6 +1062,12 @@ class LuaInterpreter(LuaParserVisitor):
                     return left == right
                 elif op == "~=":
                     return left != right
+                elif op == "%" and tl is int and tr is int and right != 0:
+                    return left % right
+                elif op == "//" and tl is int and tr is int and right != 0:
+                    r = left // right
+                elif op == "/" and right != 0:
+                    return float(left) / float(right)
                 else:
                     return self._binary_op(op, left, right, exps)
                 if tl is int and tr is int and not (MININT <= r <= MAXINT):
@@ -856,7 +1081,7 @@ class LuaInterpreter(LuaParserVisitor):
         return None
 
     def _unary_op(self, op, exps):
-        val = unwrap_one(exps[0].accept(self))
+        val = unwrap_one(self.visitExp(exps[0]))
         if op == "not":
             return val is None or val is False
         if op == "#":

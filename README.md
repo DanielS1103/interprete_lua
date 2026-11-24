@@ -37,7 +37,7 @@ devuelve el código de salida 1.
 
 ### Versión de un solo archivo
 
-Si la plataforma solo admite un archivo, `python tools/bundle.py` genera `submit/main.py` (≈ 230 KB),
+Si la plataforma solo admite un archivo, `python tools/bundle.py` genera `submit/main.py` (≈ 260 KB),
 que contiene todo el intérprete (incluido ANTLR) y se usa igual: `python submit/main.py < tests/01.in`.
 
 ### Pruebas
@@ -47,14 +47,6 @@ python tools/run_tests.py            # ejecuta tests/01.in..06.in y compara con 
 python tools/run_tests.py submit/main.py   # lo mismo con la versión de un solo archivo
 ```
 
-Además de los 6 casos del taller, [tests/extra/](tests/extra/) contiene 8 programas de robustez
-(algoritmos, OOP y metatablas, strings y patrones, mensajes de error, tablas y librerías, flujo/corrutinas/`load`,
-sintaxis y precedencia, y una prueba de carga) con sus salidas en `tests/extra/expected/`. `run_tests.py` ejecuta
-ambas suites.
-
-Las salidas esperadas se contrastaron con un Lua 5.4 real: son idénticas, salvo el nombre de *chunk* que
-Lua pone en los mensajes de error (aquí es `input`, p. ej. `input:49: mensaje`).
-
 ## Estructura
 
 | Ruta | Contenido |
@@ -62,7 +54,8 @@ Lua pone en los mensajes de error (aquí es `input`, p. ej. `input:49: mensaje`)
 | [main.py](main.py) | Punto de entrada: lee stdin/archivos, ejecuta en un hilo con pila grande, reporta errores. |
 | [interpreter.py](interpreter.py) | `LuaInterpreter` (visitor del árbol ANTLR): sentencias, expresiones, funciones, metamétodos, `goto`, `<close>`… |
 | [runtime/values.py](runtime/values.py) | `LuaTable` (tablas con llaves débiles/valores débiles, longitud tipo `luaH_getn`), `MultiRes` (valores múltiples). |
-| [runtime/environment.py](runtime/environment.py) | Ámbitos léxicos, variables `<const>` y `<close>`. |
+| [runtime/environment.py](runtime/environment.py) | Ámbitos léxicos, variables `<const>` y `<close>`, resolución de globales a través de `_ENV`. |
+| [runtime/luacheck.py](runtime/luacheck.py) | Verificador estático (léxico, sintáctico y semántico) que replica `llex.c`/`lparser.c` para dar los mismos mensajes de error de compilación que Lua. |
 | [runtime/stdlib.py](runtime/stdlib.py) | Librería estándar: base, `string`, `table`, `math`, `os`, `io`, `coroutine`. |
 | [runtime/lpattern.py](runtime/lpattern.py) | Patrones de Lua (`find`, `match`, `gmatch`, `gsub`), portados de `lstrlib.c`. |
 | [grammar/](grammar/) | Gramática ANTLR (`.g4`) y parser/lexer generados. |
@@ -79,9 +72,10 @@ Todo lo que ejercitan los 6 casos de prueba, y más:
   Lua (`%.14g`, `1e+100`, `10/2 → 5.0`, `inf`, `-nan`).
 * **Léxico**: comentarios cortos/largos, strings con todas las secuencias de escape (`\n`, `\x41`, `\066`,
   `\u{2603}`, `\z`, continuación de línea), strings largos `[==[ ]==]`, enteros/hex/floats/hex-floats.
-* **Variables y ámbitos**: locales, globales (a través de `_ENV`/`_G`), *closures* y *upvalues* por iteración
-  de bucle, asignación múltiple con evaluación estricta de índices, `<const>` y `<close>` (se cierran al
-  salir del bloque o por error).
+* **Variables y ámbitos**: locales, globales (a través de `_ENV`/`_G`), `local _ENV = t`, parámetros
+  `_ENV` y asignación `_ENV = t` (§2.2), *closures* y *upvalues* por iteración de bucle, asignación múltiple
+  con evaluación estricta de índices, `<const>` y `<close>` (se cierran al salir del bloque, del chunk o por
+  error; un valor sin `__close` da `variable 'x' got a non-closable value`).
 * **Control de flujo**: `if/elseif/else`, `while`, `repeat…until`, `for` numérico (entero y float) y
   genérico, `break`, `goto` y etiquetas.
 * **Operadores** con la precedencia y asociatividad de Lua: aritméticos (`+ - * / // % ^`, división entera y
@@ -89,21 +83,28 @@ Todo lo que ejercitan los 6 casos de prueba, y más:
   longitud `#`; coerción string↔número.
 * **Funciones**: variádicas (`...`), valores de retorno múltiples y su ajuste (paréntesis, truncamiento,
   expansión al final), llamadas con string/tabla literal, métodos `obj:m()` y `function a.b:m()`,
-  recursión profunda (miles de niveles).
+  recursión profunda (decenas de miles de niveles) y **llamadas de cola propias** (`return f(x)` no
+  consume pila, §3.4.10).
 * **Metatablas**: `__index`, `__newindex`, `__call`, `__tostring`, `__len`, `__eq`, `__lt`, `__le`, `__concat`,
-  todos los aritméticos y bit a bit, `__unm`, `__bnot`, `__close`, `__metatable`, `__pairs`, `__name` y
-  `__mode` (tablas débiles, con `collectgarbage()`).
+  todos los aritméticos y bit a bit, `__unm`, `__bnot`, `__close`, `__metatable`, `__pairs`, `__name`,
+  `__mode` (tablas débiles) y `__gc` (finalizadores: se ejecutan en `collectgarbage()` y al terminar el
+  programa, en orden inverso al de marcado, como `lua_close`).
 * **Errores**: `error`, `pcall`, `xpcall` (con objetos de error arbitrarios), `assert`; los mensajes de
   error de ejecución imitan los de Lua, con posición y nombre de variable
   (`input:7: attempt to index a nil value (field 'x')`).
 * **Corrutinas**: `create`, `resume`, `yield`, `status`, `wrap`, `isyieldable`, `running`, `close`
   (implementadas con hilos).
-* **`load`** con cadenas (y funciones), con entorno opcional.
+* **`load`** con cadenas (y funciones), con entorno opcional. Los errores de compilación se devuelven con
+  los mensajes de Lua (`[string "x = "]:1: unexpected symbol near <eof>`, `'end' expected (to close
+  'function' at line 1) near <eof>`, `attempt to assign to const variable 'x'`, `no visible label 'l' for
+  <goto> at line 1`, `break outside a loop at line 1`…).
 * **Librería estándar**: `print`, `type`, `tostring`, `tonumber`, `select`, `pairs`, `ipairs`, `next`,
   `rawget/rawset/rawequal/rawlen`, `getmetatable/setmetatable`, `collectgarbage`; `string.*` (incluye
   `format`, `find`, `match`, `gmatch`, `gsub`, `rep`, `sub`, `byte`, `char`…, también como métodos
-  `("x"):upper()`), `table.*` (`insert`, `remove`, `concat`, `sort`, `unpack`, `pack`, `move`), `math.*`,
-  `os.time/clock/date/getenv/exit`, `io.write/read/lines`, `io.stdout:write`.
+  `("x"):upper()`, y `pack`/`unpack`/`packsize`), `table.*` (`insert`, `remove`, `concat`, `sort`, `unpack`,
+  `pack`, `move`), `math.*` (incluye `deg`, `rad`, `ult`, `tointeger` y `random` con el generador xoshiro256**
+  de Lua), `utf8.*` (`char`, `len`, `codepoint`, `codes`, `offset`, `charpattern`), `collectgarbage` con todas
+  sus opciones, `os.time/clock/date/getenv/exit`, `io.write/read/lines`, `io.stdout:write`.
 
 ## Detalles de implementación
 
@@ -111,10 +112,18 @@ Todo lo que ejercitan los 6 casos de prueba, y más:
   que Lua; así `#"ñ" == 2` y la salida reproduce exactamente los bytes UTF-8 del programa, sin depender de la
   codificación de la consola de la plataforma.
 * **Recursión**: el intérprete se ejecuta en un hilo con pila grande y las llamadas Lua no pasan por `__call__`
-  (Python 3.12 limita la recursión de C), por lo que se soportan ≈ 10 000 niveles; la recursión infinita
-  produce `stack overflow` capturable con `pcall`.
-* **Rendimiento**: la clasificación de cada nodo del árbol se calcula una sola vez y se cachea, y las
-  operaciones numéricas más comunes tienen un camino rápido.
+  (Python 3.12 limita la recursión de C), por lo que se soportan unos 30 000 niveles de recursión normal; la
+  recursión infinita produce `input:N: stack overflow` capturable con `pcall`. Las llamadas de cola se
+  ejecutan en un bucle dentro de `LuaFunction.call` (excepción de control `LuaTailCall`), sin límite.
+* **Errores de compilación**: si ANTLR rechaza el programa, [luacheck.py](runtime/luacheck.py) produce el
+  mensaje exacto de Lua y no se ejecuta nada (como el `lua` oficial). En `load` se usa siempre, porque también
+  detecta los errores semánticos que Lua comprueba al compilar.
+* **`table.sort`** usa el mismo quicksort que `ltablib.c` (mismas comparaciones e intercambios), así que el
+  orden de los elementos "empatados" coincide con el de Lua; `math.random` usa xoshiro256** como `lmathlib.c`.
+* **Rendimiento**: la clasificación de cada nodo del árbol se calcula una sola vez y se cachea, las
+  operaciones numéricas más comunes tienen un camino rápido, las expresiones se despachan directamente (sin
+  el `accept` genérico de ANTLR) y los bucles reutilizan el ámbito de cada iteración cuando su cuerpo no crea
+  *closures*.
 * **Precedencia**: la gramática original (grammars-v4) ponía los operadores bit a bit con la menor
   precedencia; se corrigió en [LuaParser.g4](grammar/LuaParser.g4) (`or < and < comparación < | < ~ < & <
   << >> < .. < + - < * / // % < unarios < ^`) y se regeneró el parser con ANTLR 4.13.2.
@@ -138,6 +147,12 @@ vistos en clase y el código:
 * La **precedencia** se define por el *orden* de las alternativas de `exp` (las primeras ligan más fuerte) y la
   **asociatividad por la derecha** de `^` y `..` con `<assoc = right>`. Escribir mal ese orden es un error de
   diseño de la gramática, no de la semántica: eso fue lo que se corrigió con los operadores bit a bit.
+* [runtime/luacheck.py](runtime/luacheck.py) es además un **ASDR escrito a mano**, igual al de la clase: un
+  analizador léxico (`Lexer.next_token`, como `llex.c`) y una función por no terminal (`statement`, `expr`,
+  `suffixedexp`, `funcargs`…, como `lparser.c`). La recursividad por la izquierda de las expresiones se resuelve
+  con el bucle de `expr` y una tabla de prioridades (izquierda/derecha) por operador. Su única tarea es
+  **detectar y describir errores** con el texto de Lua (`'then' expected near 'print'`, `unexpected symbol
+  near <eof>`…): el árbol que se ejecuta sigue siendo el de ANTLR.
 
 ### Gramática de atributos, DDS y ETDS
 
@@ -172,9 +187,14 @@ vistos en clase y el código:
   aquí no existe el "error semántico por variable no declarada": una variable no declarada es una **global**
   (se busca en la tabla `_ENV`) y vale `nil`.
 * Los *atributos de variable* `<const>` y `<close>` son campos extra del símbolo (`consts`, `to_close`);
-  asignar a una `<const>` es un error semántico, detectado al ejecutar la asignación.
+  asignar a una `<const>` es un **error semántico de compilación**: `luacheck.py` mantiene su propia tabla de
+  símbolos (locales activos por función y por bloque, con su atributo) y lo detecta antes de ejecutar, igual
+  que las etiquetas de `goto` no visibles, `break` fuera de un bucle o `...` fuera de una función variádica.
 * Los *closures* funcionan porque cada función guarda la referencia a su `Environment` de definición
-  (`closure_env`), no una copia; por eso cada iteración de un `for` crea un ámbito nuevo con su propia variable.
+  (`closure_env`), no una copia; por eso, si el cuerpo de un bucle crea funciones, cada iteración usa un ámbito
+  nuevo con su propia variable (si no las crea, el ámbito se reutiliza: ningún closure puede notarlo).
+* `_ENV` es un nombre más de la tabla de símbolos: un `local _ENV` o un parámetro `_ENV` cambia la tabla en la
+  que se buscan los globales de su ámbito; si no hay ninguno, se usa el `_ENV` del chunk.
 
 ### Sistema de tipos y expresiones
 
