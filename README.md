@@ -13,8 +13,6 @@ escrito en **Python 3**: el análisis léxico y sintáctico lo hace un parser ge
 | _Miguel Angel Suarez Cortez_ | _miasuarezco@unal.edu.co_ |
 | _Julian Esteban Mendoza Wilches_ | _jmendozaw@unal.edu.co_ |
 
-> Completar antes de la entrega. Recordar que **solo una persona** del grupo realiza los envíos.
-
 ## Requisitos y ejecución
 
 * **Python 3.8 o superior** (probado con 3.12). No hace falta instalar nada: el runtime de ANTLR (Python puro) viene incluido
