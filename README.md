@@ -7,11 +7,11 @@ escrito en **Python 3**: el análisis léxico y sintáctico lo hace un parser ge
 
 ## Integrantes
 
-| Nombre | Correo / usuario |
+| Nombre | Correo |
 |---|---|
 | _Daniel Alejandro Acosta Avila_ | _dacostaav@unal.edu.co_ |
-| _<nombre 2>_ | _<correo>_ |
-| _<nombre 3>_ | _<correo>_ |
+| _Miguel Angel Suarez Cortez_ | _miasuarezco@unal.edu.co_ |
+| _Julian Esteban Mendoza Wilches_ | _jmendozaw@unal.edu.co_ |
 
 > Completar antes de la entrega. Recordar que **solo una persona** del grupo realiza los envíos.
 
